@@ -7,3 +7,4 @@ typing
 python-dotenv
 transformers
 sentence-transformers
+weblinx[full]
