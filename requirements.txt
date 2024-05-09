@@ -1,0 +1,9 @@
+asyncio
+lxml
+re
+functools
+openai
+typing
+python-dotenv
+transformers
+sentence-transformers
