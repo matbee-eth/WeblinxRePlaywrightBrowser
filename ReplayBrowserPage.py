@@ -86,7 +86,8 @@ class ReplayBrowserPage(EventMixin, Replay):
 
     async def click(self, uid, **kwargs):
             if uid == None:
-                pass
+                return
+            print("ReplayBrowserPage:click:::", uid)
             selector = f'[data-webtasks-id="{uid}"]'
             # JavaScript to add a listener to the element that captures the event data
             try:
@@ -115,12 +116,11 @@ class ReplayBrowserPage(EventMixin, Replay):
             # Construct arguments object with metadata and event data
             arguments = await self.arguments(uid)
             if event_data != None:
-                arguments["properties"] = arguments["properties"] + event_data
-            # {
+                arguments["properties"].update(event_data)
             #     "metadata": metadata,
             #     "properties": event_data  # This now contains the event details captured
             # }
-            await self.log_action("click", arguments=arguments)
+            # await self.log_action("click", arguments=arguments)
 
             # Log the click action with detailed arguments
     
@@ -132,10 +132,13 @@ class ReplayBrowserPage(EventMixin, Replay):
             zoomLevel: document.documentElement.style.zoom || 1
         })""")
     
-    def seed_html_uids(self):
-        return self._page.evaluate("""() => {
+    async def seed_html_uids(self):
+        if not self._page.url.startswith("http://") and not self._page.url.startswith("https://"):
+            return
+        return await self._page.evaluate("""() => {
                                     let elementToBoundingBox = {};
                                     document.querySelectorAll('*').forEach(element => {
+                                            if (element === document.body) return
                                             const boundingBox = element.getBoundingClientRect();
                                             const { innerHeight, innerWidth } = window;
 
@@ -143,10 +146,13 @@ class ReplayBrowserPage(EventMixin, Replay):
                                             const isVisible = boundingBox.width > 1 && boundingBox.height > 1;
 
                                             if (isInViewport && isVisible) {
-                                                let myuuid = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
-                                                elementToBoundingBox[myuuid] = boundingBox;
+                                                
                                                 if (!element.hasAttribute('data-webtasks-id')) {
+                                                    let myuuid = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+                                                    elementToBoundingBox[myuuid] = boundingBox;
                                                     element.setAttribute('data-webtasks-id', myuuid);
+                                                } else {
+                                                    elementToBoundingBox[element.getAttribute('data-webtasks-id')] = boundingBox;
                                                 }
                                             }
                                     });
@@ -178,6 +184,7 @@ class ReplayBrowserPage(EventMixin, Replay):
         """
         # Perform the navigation
         result = await self._page.goto(url)
+        await self.wait_for_load_state("networkidle")
         arguments = await self.arguments()
         
         await self.log_action("load", arguments=arguments, speaker=speaker)
@@ -213,10 +220,9 @@ class ReplayBrowserPage(EventMixin, Replay):
         Adds a chat Turn to the Replay with a specified speaker and utterance.
         """
         image_path = f"{self.base_dir}/screenshots/{dt.datetime.now().isoformat()}.png"
-        screenshot_path = await self._page.screenshot(path=image_path)
-        page_html = await self._page.content()
-
+        await self._page.screenshot(path=image_path)
         bboxes = await self.seed_html_uids()
+        page_html = await self._page.content()
         metadata = await self.get_page_metadata()
         arguments = {
             "bboxes": bboxes,
@@ -245,7 +251,9 @@ class ReplayBrowserPage(EventMixin, Replay):
             "metadata": arguments["metadata"]
         }
         self.data_dict.append(turn_dict)
-        turn = Turn(turn_dict, index=len(self.data_dict), base_dir=self.base_dir)
+        turn = self[-1]
+        # turn = Turn(turn_dict, index=len(self.data_dict), base_dir=self.base_dir)
+        print("PAGE HTML::::", metadata['url'], turn.index, turn.has_html(), turn.intent)
         await self.emit('chat', turn)
         return turn
 

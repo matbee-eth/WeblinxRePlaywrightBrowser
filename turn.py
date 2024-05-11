@@ -438,21 +438,24 @@ class Turn(dict):
         """
         Returns True if the turn has an associated HTML page, False otherwise
         """
+        print("HAS_HTML?")
         state = self.get("state")
         if state is None:
+            print("NO HAS_HTML")
             return False
-
-        return state.get("page") is not None
+        if self.url == "about:blank":
+            return False
+        print("HAS_HTML?", state.get("page") is not None)
+        page = state.get("page")
+        return page is not None and page != ""
 
     def has_bboxes(self, subdir: str = "bboxes", page_subdir: str = "pages"):
         """
         Checks if the turn has bounding boxes
         """
         return (
-            self.get_bboxes_path(
-                subdir=subdir, page_subdir=page_subdir, throw_error=False
-            )
-            is not None
+            len(self.bboxes)
+            is not 0
         )
 
     def get_screenshot_path(
@@ -505,6 +508,7 @@ class Turn(dict):
         throw_error: bool
             If True, throws an error if the turn does not have an HTML page, otherwise returns None
         """
+        print("TURN:::DO I HAVE HTML???", self.has_html())
         if not self.has_html():
             if throw_error:
                 raise ValueError(f"Turn {self.index} does not have an HTML page")

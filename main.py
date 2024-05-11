@@ -1,9 +1,18 @@
-import os
+import logging
+
+logging.getLogger("requests").setLevel(logging.CRITICAL)
+logging.getLogger("httpcore").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 import json
+import os
 import asyncio
+
+from tqdm.auto import tqdm
+from replay import Replay
 import lxml.html
 import re
 import weblinx.utils.format as wlf
+import shlex
 from functools import partial
 from openai import OpenAI
 from typing import Callable, List
@@ -18,8 +27,6 @@ from ReplayBrowserPage import ReplayBrowserPage, launch_custom_chromium
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.util import cos_sim, dot_score
 from weblinx.processing.prompt import (
-    build_input_records_from_selected_turns,
-    find_turns_with_instructor_chat,
     format_candidates,
     format_utterances,
     format_utterances_truncated,
@@ -57,29 +64,36 @@ async def main():
 
     async def onChatReceived(turn: Turn):
         print ("turn speaker:", turn.get("speaker"))
-        [utterance_context, prev_text] = format_turn_for_input(page, turn, format_intent=format_intent_input, return_str=False)
         query = format_turn_for_input(page, turn, format_intent=format_intent_input)
-        uids = await page.seed_html_uids()
-        elements_records = format_relevant_elements_for_single_turn(turn=turn)
-        docs = [r['doc'] for r in elements_records]
-        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        encoded = model.encode(
-            [query] + docs, batch_size=4, show_progress_bar=False
-        )
-        query_vector, doc_vectors = encoded[0], encoded[1:]
-        scores = cos_sim(query_vector, doc_vectors).cpu().squeeze().tolist()
-        for i, record in enumerate(elements_records):
-            record['score'] = scores[i]
-        elements_records.sort(key=lambda x: x['score'], reverse=True)
-        elements_records = elements_records[:10]
-        selected_turns = [{"replay": page, "turn": turn, "cands_turn":elements_records} for turn in page]
+        print("query", query)
+        # uids = await page.seed_html_uids()
+        elements_records = []
+        print("DOES TURN HAVE HTML???", turn.has_html())
+        if turn.has_html():
+            elements_records = format_relevant_elements_for_single_turn(turn=turn)
+            print("elements_records", elements_records)
+            docs = [r['doc'] for r in elements_records]
+            model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+            encoded = model.encode(
+                [query] + docs, batch_size=4, show_progress_bar=False
+            )
+            query_vector, doc_vectors = encoded[0], encoded[1:]
+            scores = cos_sim(query_vector, doc_vectors).cpu().squeeze().tolist()
+            elements_records = [
+                {**record, 'score': score} for record, score in zip(elements_records, scores)
+            ]
+            elements_records.sort(key=lambda x: x['score'], reverse=True)
+            elements_records = elements_records[:10]
+            for record in elements_records:
+                print("record", json.dumps(record))
+
         format_intent = build_formatter_for_multichoice()
         input_records = build_input_records_from_selected_turns(
-            selected_turns=selected_turns,
+            selected_turns=[{"replay": page, "turn": turn, "cands_turn":elements_records}],
             format_intent=format_intent,
             build_prompt_records_fn=partial(
                 build_prompt_records_for_llama_truncated,
-                num_utterances=len(page)+1,
+                num_utterances=len(page),
                 format_intent=format_intent,
                 tokenizer=tokenizer,
                 include_images=True,
@@ -90,11 +104,12 @@ async def main():
         insert_formatted_chat_into_records(
             records=input_records, processor=tokenizer, include_output_target=True
         )
+        # print("input_records", input_records)
         messages = input_records[0]["prompt"]
-        messages.append({
-            "role": "user", 
-            "content": prev_text
-        })
+        # messages.append({
+        #     "role": "user", 
+        #     "content": prev_text
+        # })
         chat_completion = client.chat.completions.create(
             model=model_name,
             messages=messages,
@@ -102,8 +117,9 @@ async def main():
             max_tokens=150,
         )
         await execute_parsed_actions(chat_completion.choices[0].message.content, turn)
-        await listen_and_execute_chat_command()
-    import sys
+        # await listen_and_execute_chat_command()
+
+        await page.chat("sign into gmail")
 
     # Function to listen for user's command line input and execute page.chat with the value
     async def listen_and_execute_chat_command():
@@ -114,18 +130,148 @@ async def main():
             await page.chat(user_input)
             print(f"Executed chat command: {user_input}")
         except Exception as e:
-            print(f"An error occurred while executing the chat command: {e}")
+            print(f"An error occurred while executing the chat command: {e}", e.with_traceback())
 
     async def handle_chat(turn):
         print("turn", turn)
         await onChatReceived(turn)
 
     page.on("chat", handle_chat)
-    try:
-        print("page?", page)
-        await page.chat("open up gmail")
-    except ValueError as e:
-        print(f"Error during chat operation: {e}")
+    await page.chat("load up gmail")
+    # try:
+    #     await listen_and_execute_chat_command()
+    # except ValueError as e:
+    #     print(f"Error during chat operation: {e}")
+
+
+def build_input_records_from_selected_turns(
+    selected_turns,
+    format_intent,
+    build_prompt_records_fn,
+    format_prompt_records_fn,
+):
+    """
+    This will build the input records for the model. The input records are a list of dictionaries,
+    which contains the following keys:
+    - demo_name: The name of the demonstration
+    - base_dir: The base directory of the demonstration
+    - turn_index: The index of the turn
+    - prompt: The prompt to use for the model
+    - output_target: The target output for the model
+    - output_target_dict: The target output for the model, but in dictionary format
+
+    If `candidates` is not None, then the prompt includes the candidates as well.
+
+    Parameters
+    ----------
+    selected_turns : list
+        The list of selected turns to build the input records from.
+
+    format_intent : Callable
+        A function that takes a turn and returns a string or a dictionary.
+
+    build_prompt_records_fn : Callable
+        A function that takes a replay, turn, and cands_turn, and returns the prompt records.
+
+    format_prompt_records_fn : Callable
+        A function that takes the prompt records and formats them.
+
+    Returns
+    -------
+    list
+        A list of input records for the model.
+    """
+    input_records = []
+    for selected_turn_dict in tqdm(selected_turns, desc="Building input records"):
+        rec = build_input_record_for_single_turn(
+            turn_dict=selected_turn_dict,
+            format_intent=format_intent,
+            build_prompt_records_fn=build_prompt_records_fn,
+            format_prompt_records_fn=format_prompt_records_fn,
+        )
+
+        input_records.append(rec)
+
+    return input_records
+
+def build_input_record_for_single_turn(
+    turn_dict,
+    format_intent,
+    build_prompt_records_fn,
+    format_prompt_records_fn,
+):
+    """
+    This builds the input record for a single turn. The input record is a dictionary, which contains
+    the following
+    - demo_name: The name of the demonstration
+    - base_dir: The base directory of the demonstration
+    - turn_index: The index of the turn
+    - prompt: The prompt to use for the model
+    - output_target: The target output for the model
+    - output_target_dict: The target output for the model, but in dictionary format
+
+    If `candidates` is not None, then the prompt includes the candidates as well.
+
+    Parameters
+    ----------
+    turn_dict : dict
+        A dictionary containing the following
+        - replay: The replay for the turn
+        - turn: The turn to use for the prompt
+        - cands_turn: The candidates for the turn, or None if no candidates are found
+
+    format_intent : Callable
+        A function that takes a turn and returns a string or a dictionary.
+
+    build_prompt_records_fn : Callable
+        A function that takes a replay, turn, and cands_turn, and returns the prompt records.
+
+    format_prompt_records_fn : Callable
+        A function that takes the prompt records and formats them.
+
+    Returns
+    -------
+    dict
+        The input record for the model.
+    """
+    replay = turn_dict["replay"]
+    turn = turn_dict["turn"]
+    cands_turn = turn_dict["cands_turn"]
+    print("build_input_record_for_single_turn CANDS_TURN:::::", cands_turn)
+    prompt_recs = build_prompt_records_fn(
+        replay=replay,
+        turn=turn,
+        cands_turn=cands_turn,
+    )
+
+    print("prompt_recs", prompt_recs)
+
+    if format_prompt_records_fn is None:
+        prompt_fmt = prompt_recs
+    else:
+        prompt_fmt = format_prompt_records_fn(prompt_recs)
+
+    print("build_input_record_for_single_turn", json.dumps({
+        "demo_name": turn.demo_name,
+        "base_dir": turn.base_dir,
+        "turn_index": turn.index,
+        "prompt": prompt_fmt,
+        "output_target": format_intent(turn, return_as=str),
+        "output_target_dict": format_intent(turn, return_as=dict),
+        "use_candidates": cands_turn is not None,
+        "screenshot_path": turn.get_screenshot_path(),
+    }))
+    
+    return {
+        "demo_name": turn.demo_name,
+        "base_dir": turn.base_dir,
+        "turn_index": turn.index,
+        "prompt": prompt_fmt,
+        "output_target": format_intent(turn, return_as=str),
+        "output_target_dict": format_intent(turn, return_as=dict),
+        "use_candidates": cands_turn is not None,
+        "screenshot_path": turn.get_screenshot_path(),
+    }
 
 def merge_prev_turns(prev_turns_text_list, final_user_message):
     prev_turns_merged = []
@@ -150,7 +296,6 @@ def merge_prev_turns(prev_turns_text_list, final_user_message):
         prev_turns_merged.append({"role": "user", "content": final_user_message})
 
     return prev_turns_merged
-
 
 def get_system_prompt_template_for_llama_mc_concise(height=None, width=None):
     viewport_size = f"Viewport size: {height}h x {width}w ;\n" if height and width else ""
@@ -180,6 +325,28 @@ def get_candidate_prompt_template_for_llama():
 
 def get_final_user_message():
     return "Please select the best action using the correct format, do not provide any other information or explanation."
+
+def find_turns_with_instructor_chat(
+    replay: "Replay", turn: "Turn", speaker="instructor", num_prev_turns=0
+):
+    """
+    This looks for all the turns in `replay` up to `turn` (minus `num_prev_turns` turns)
+    that are by `speaker` (default: instructor). This is used to find the instructor's utterances
+    that are used as context for the current turn. The reason we have a num_prev_turns parameter
+    is because we want to limit the number of turns we look at, as the last num_prev_turns turns
+    can be displayed by another function, such as `format_prev_turns`, separate from this.
+
+    This output of this function should be used by format_utterances to display the utterances.
+    """
+    start_index = max(0, turn.index - num_prev_turns)
+    lambda_func = (
+        lambda turn: turn.get("speaker") == speaker
+    )
+    if isinstance(replay, list):
+        instructor_chat_turns = list(filter(lambda_func, replay))
+    else:
+        instructor_chat_turns = replay.filter_turns(lambda_func)
+    return instructor_chat_turns
 
 def build_prompt_records_for_llama_truncated(
     replay,
@@ -235,6 +402,7 @@ def build_prompt_records_for_llama_truncated(
     instructor_chat_turns = find_turns_with_instructor_chat(
         replay, turn, num_prev_turns=num_prev_turns
     )
+    print("instructor_chat_turns", instructor_chat_turns)
     utterance_context = format_utterances_truncated(
         instructor_chat_turns,
         tokenizer=tokenizer,
@@ -243,7 +411,7 @@ def build_prompt_records_for_llama_truncated(
         format_utterances_fn=format_utterances,
         allow_iterative_reduction=allow_iterative_reduction,
     )
-
+    print("utterance_context", utterance_context)
     prev_turns_text_list = multi_attempt_format_prev_turns_truncated(
         replay=replay,
         turn=turn,
@@ -257,10 +425,12 @@ def build_prompt_records_for_llama_truncated(
         warn_after_attempts=False,
         allow_iterative_reduction=allow_iterative_reduction,
     )
+    print("prev_turns_text_list", prev_turns_text_list)
 
     prev_turns_merged = merge_prev_turns_fn(
         prev_turns_text_list=prev_turns_text_list, final_user_message=final_user_message
     )
+    print('prev_turns_merged', prev_turns_merged)
 
     sys_prompt = system_prompt_template.format(
         num_utterances=num_utterances - 1,  # 1 less since we add the first utterance
@@ -269,10 +439,13 @@ def build_prompt_records_for_llama_truncated(
         width=turn.viewport_width,
         num_prev_turns=num_prev_turns,
     )
-
+    # print('sys_prompt', sys_prompt)
+    print("CANDS_TURN?????", cands_turn)
     if include_html and turn.html not in ["", None] and cands_turn is not None:
         dom_tree_raw = lxml.html.fromstring(turn.html, parser=parser)
+        print("dom_tree_raw", dom_tree_raw)
         dom_tree_pruned = clean_and_prune_tree(dom_tree_raw, cands_turn=cands_turn)
+        print("dom_tree_pruned", dom_tree_pruned)
         trunc = multi_attempt_truncate_dom_tree(
             dom_tree=dom_tree_pruned,
             tokenizer=tokenizer,
@@ -280,12 +453,16 @@ def build_prompt_records_for_llama_truncated(
             warn_after_attempts=False,
             allow_iterative_reduction=allow_iterative_reduction,
         )
+        print("trunc[tree_repr]", trunc["tree_repr"])
         html = trunc["tree_repr"]
+        print("json.dumps(html)", json.dumps(html))
         sys_prompt = f"```html\n{html}\n```\n" + sys_prompt
     else:
         html = ""
+    print("include_html turn.html", include_html, html)
 
     if cands_turn is not None:
+        print("cands_turn", cands_turn)
         if add_unused_len_to_cands:
             # Add the unused length to the candidates
             num_html_tokens = len(tokenizer.tokenize(html))
@@ -302,20 +479,21 @@ def build_prompt_records_for_llama_truncated(
             # Add the unused length to the max_candidates_tokens
             max_candidates_tokens += remain_tokens
 
-        cands_turn_trunc = multi_attempt_truncate_cands_turn(
-            cands_turn=cands_turn,
-            tokenizer=tokenizer,
-            max_tokens=max_candidates_tokens,
-            format_candidates_fn=format_candidates_fn,
-            warn_after_attempts=False,
-            allow_iterative_reduction=allow_iterative_reduction,
-        )
-        cand_str = format_candidates_fn(cands_turn_trunc, max_char_len=None)
+        # cands_turn_trunc = multi_attempt_truncate_cands_turn(
+        #     cands_turn=cands_turn,
+        #     tokenizer=tokenizer,
+        #     max_tokens=max_candidates_tokens,
+        #     format_candidates_fn=format_candidates_fn,
+        #     warn_after_attempts=False,
+        #     allow_iterative_reduction=allow_iterative_reduction,
+        # )
+        # print("cands_turn_trunc", cands_turn_trunc)
+        cand_str = format_candidates_fn(cands_turn, max_char_len=None)
+        print("cand_str", cand_str)
         cand_prompt = candidate_prompt_template.format(candidate_str=cand_str)
         sys_prompt += "\n" + cand_prompt
-
+    print("NEW SYS PROMPT", sys_prompt)
     return [{"role": "system", "content": sys_prompt}, *prev_turns_merged]
-
 
 def build_formatter_for_multichoice():
     format_click = partial(wlf.format_click, formatters=(wlf.format_uid,))
@@ -365,28 +543,35 @@ def format_relevant_elements_for_single_turn(
         viewport_height=turn.viewport_height,
         viewport_width=turn.viewport_width,
     )
+    print("bboxes_filt", len(bboxes_filt))
     root = lxml.html.fromstring(turn.html)
     root_tree = root.getroottree()
-    elements = root.xpath(f"//*[@{uid_key}]")
-    elements_filt = [p for p in elements if p.attrib[uid_key] in bboxes_filt]
+    body = root.xpath("//body")[0]
+    elements = body.xpath(f".//*[@{uid_key}]")
+    print("elements", len(elements))
+    for element in elements[:10]:
+        print("uid_key", element.attrib[uid_key])
+    elements_filt = [element for element in elements if element.attrib[uid_key] not in [None, ""]]
 
+    print("elements_filt", len(elements_filt))
     records = []
-
+    print("turn.bboxes", turn.bboxes)
     for elem in elements_filt:
         bbox = turn.bboxes[elem.attrib[uid_key]]
         elem_dict = represent_element_as_dict(elem, bbox, root_tree)
+        print("elem_dict", elem_dict)
         elem_str = convert_elem_dict_to_str_legacy(elem_dict)
-
+        print("elem_str", elem_str)
         record = {
             "doc": elem_str,
             "uid": elem.attrib[uid_key],
             "turn_index": turn.index,
             "elem_dict": elem_dict,
         }
+        print("APPENDING RECORD", record)
         records.append(record)
     return records
 
-import shlex
 async def execute_parsed_actions(chat_response: str, turn: Turn):
     """
     Parses the chat response and dynamically executes the actions on the global `page` object.

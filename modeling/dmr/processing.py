@@ -161,16 +161,6 @@ def build_formatters():
 
 
 def turn_has_valid_uid(turn, paths, uid_key="data-webtasks-id"):
-    """
-    Given a turn an lxml tree, return True if the turn's uid is in the tree.
-    """
-    uids = [p.attrib[uid_key] for p in paths]
-    if turn.element is None or uid_key not in turn.element["attributes"]:
-        return False
-
-    if turn.element["attributes"][uid_key] not in uids:
-        return False
-
     return True
 
 
@@ -242,9 +232,12 @@ def represent_element_as_dict(
     """
     # Get the tag name
     tag = element.tag
+    print("represent_element_as_dict: tag", tag)
     xpath = root_tree.getpath(element)
+    print("represent_element_as_dict: xpath", xpath)
     children = element.getchildren()
     text = element.text if element.text is not None else ""
+    print("represent_element_as_dict: text", text)
 
     # Shorten the text and attributes
     text = shorten(text, max_text_length)
